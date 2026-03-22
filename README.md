@@ -256,6 +256,22 @@ The project is not affiliated with any smartwatch manufacturer.
 
 ---
 
+## Features
+
+- BLE device scanning
+- Smartwatch connection
+- GATT service discovery
+
+### Implemented Features
+- Battery level reading (with periodic updates every 60 seconds)
+- Heart rate measurement
+- Vibration control
+- Find device mode (sound + vibration)
+
+### In Progress
+- Reverse engineering BLE commands
+- Additional smartwatch features
+
 License
 
 MIT License
