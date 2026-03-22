@@ -6,8 +6,6 @@ import android.bluetooth.le.*
 import android.content.*
 import android.content.pm.PackageManager
 import android.os.*
-import android.view.Gravity
-import android.view.ViewGroup
 import android.widget.*
 import androidx.activity.ComponentActivity
 import androidx.core.app.ActivityCompat
@@ -15,471 +13,254 @@ import java.util.*
 
 class MainActivity : ComponentActivity() {
 
-    private val handler = Handler(Looper.getMainLooper())
+    companion object {
+        val UUID_SERVICE = UUID.fromString("0000feea-0000-1000-8000-00805f9b34fb")
+        val UUID_WRITE   = UUID.fromString("0000fee2-0000-1000-8000-00805f9b34fb")
+        val UUID_NOTIFY  = UUID.fromString("0000fee3-0000-1000-8000-00805f9b34fb")
+        val UUID_DESC    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    private lateinit var scanner: BluetoothLeScanner
+        val UUID_BATTERY_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+        val UUID_BATTERY_CHAR    = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+
+        const val BATTERY_INTERVAL = 60000L // 🔋 Intervalo de 1 minuto (60.000 ms)
+    }
+
     private var bluetoothGatt: BluetoothGatt? = null
+    private val queue: Queue<ByteArray> = LinkedList()
+    private var isWriting = false
+    private var lastBatteryLevel = "--"
+
+    // 🕒 Handler para agendamento automático
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val batteryRunnable = object : Runnable {
+        override fun run() {
+            readBatteryLevel()
+            mainHandler.postDelayed(this, BATTERY_INTERVAL)
+        }
+    }
 
     private lateinit var statusText: TextView
-    private lateinit var batteryText: TextView
     private lateinit var heartText: TextView
     private lateinit var stepsText: TextView
-    private lateinit var caloriesText: TextView
     private lateinit var logText: TextView
-    private lateinit var scrollView: ScrollView
-
-    private val discoveredDevices = mutableSetOf<String>()
+    private lateinit var scroll: ScrollView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setupUI()
+        requestPermissions()
+        startScan()
+    }
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(40,40,40,120)
+    // Parar o agendamento se a app for fechada
+    override fun onDestroy() {
+        super.onDestroy()
+        mainHandler.removeCallbacks(batteryRunnable)
+    }
 
-        val title = TextView(this)
-        title.text = "Smartwatch Bridge"
-        title.textSize = 24f
-        title.gravity = Gravity.CENTER
+    private fun setupUI() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(40,40,40,40)
+        }
 
-        statusText = TextView(this)
-        statusText.text = "Status: starting..."
+        statusText = TextView(this).apply { text = "Procurando..." }
+        heartText = TextView(this).apply { textSize = 24f; text = "❤️ -- bpm" }
+        stepsText = TextView(this).apply { textSize = 24f; text = "👟 -- passos" }
 
-        batteryText = TextView(this)
-        batteryText.text = "🔋 Battery: --"
-
-        heartText = TextView(this)
-        heartText.textSize = 24f
-        heartText.text = "❤️ -- bpm"
-
-        stepsText = TextView(this)
-        stepsText.textSize = 24f
-        stepsText.text = "👟 --"
-
-        caloriesText = TextView(this)
-        caloriesText.textSize = 22f
-        caloriesText.text = "🔥 -- kcal"
-
-        root.addView(title)
         root.addView(statusText)
-        root.addView(batteryText)
         root.addView(heartText)
         root.addView(stepsText)
-        root.addView(caloriesText)
 
-        val buttonsLayout = LinearLayout(this)
-        buttonsLayout.orientation = LinearLayout.VERTICAL
+        val grid = GridLayout(this).apply { columnCount = 2 }
 
-        val vibrateButton = Button(this)
-        vibrateButton.text = "VIBRATE"
+        fun btn(label:String, action:()->Unit) {
+            grid.addView(Button(this).apply {
+                text = label
+                setOnClickListener { action() }
+            })
+        }
 
-        val heartButton = Button(this)
-        heartButton.text = "START HEART"
+        btn("VIBRAR") { send(0x53, byteArrayOf(0x0C)) }
+        btn("FIND") { send(0x61) }
+        btn("START HR") { startHR() }
+        btn("SYNC STEPS") { send(0x08) }
 
-        val syncButton = Button(this)
-        syncButton.text = "SYNC DATA"
+        root.addView(grid)
 
-        val serviceScanButton = Button(this)
-        serviceScanButton.text = "SCAN SERVICES"
+        logText = TextView(this).apply { textSize = 10f }
+        scroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(-1,0,1f)
+            addView(logText)
+        }
 
-        val commandScanButton = Button(this)
-        commandScanButton.text = "SCAN COMMANDS"
-
-        val copyLogsButton = Button(this)
-        copyLogsButton.text = "COPY LOGS"
-
-        val clearLogsButton = Button(this)
-        clearLogsButton.text = "CLEAR LOGS"
-
-        buttonsLayout.addView(vibrateButton)
-        buttonsLayout.addView(heartButton)
-        buttonsLayout.addView(syncButton)
-        buttonsLayout.addView(serviceScanButton)
-        buttonsLayout.addView(commandScanButton)
-        buttonsLayout.addView(copyLogsButton)
-        buttonsLayout.addView(clearLogsButton)
-
-        root.addView(buttonsLayout)
-
-        logText = TextView(this)
-        logText.text = "--- BLE LOG ---\n"
-        logText.textSize = 13f
-        logText.setTextIsSelectable(true)
-
-        scrollView = ScrollView(this)
-        scrollView.addView(logText)
-
-        val params = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            0
-        )
-        params.weight = 1f
-
-        scrollView.layoutParams = params
-        root.addView(scrollView)
-
+        root.addView(scroll)
         setContentView(root)
-
-        vibrateButton.setOnClickListener { sendCommand(0x12,0x01) }
-
-        heartButton.setOnClickListener {
-            log("Start heart sensor")
-            sendCommand(0x15,0x01)
-        }
-
-        syncButton.setOnClickListener { syncWatchData() }
-
-        serviceScanButton.setOnClickListener { scanServices() }
-
-        commandScanButton.setOnClickListener { startCommandScan() }
-
-        copyLogsButton.setOnClickListener {
-
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val clip = ClipData.newPlainText("logs", logText.text.toString())
-            clipboard.setPrimaryClip(clip)
-
-            Toast.makeText(this,"Logs copied",Toast.LENGTH_SHORT).show()
-        }
-
-        clearLogsButton.setOnClickListener {
-            logText.text = "--- BLE LOG ---\n"
-        }
-
-        log("App started")
-
-        requestBlePermissions()
-
-        val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-
-        if (bluetoothAdapter == null) {
-            log("Bluetooth not supported")
-            return
-        }
-
-        if (!bluetoothAdapter.isEnabled) {
-            log("Bluetooth OFF")
-            return
-        }
-
-        scanner = bluetoothAdapter.bluetoothLeScanner
-
-        startBleScan()
     }
 
-    private fun log(message:String){
-        runOnUiThread{
-            logText.append("$message\n")
-            scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+    // =========================
+    // 🔋 BATTERY LOGIC
+    // =========================
+    private fun readBatteryLevel() {
+        val g = bluetoothGatt ?: return
+        val batChar = g.getService(UUID_BATTERY_SERVICE)?.getCharacteristic(UUID_BATTERY_CHAR)
+
+        if (batChar != null && !isWriting &&
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            log("🔋 Lendo Bateria...")
+            g.readCharacteristic(batChar)
         }
     }
 
-    private fun requestBlePermissions(){
+    private fun build(cmd:Int, payload:ByteArray = byteArrayOf()):ByteArray{
+        val p = ByteArray(20)
+        p[0]=0xFE.toByte()
+        p[1]=0xEA.toByte()
+        p[2]=0x20
+        p[3]=(5+payload.size).toByte()
+        p[4]=cmd.toByte()
 
-        val permissions = arrayOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        )
+        System.arraycopy(payload,0,p,5,payload.size)
 
-        ActivityCompat.requestPermissions(this,permissions,1)
+        var sum=0
+        for(i in 0 until 19) sum+=p[i].toInt() and 0xFF
+        p[19]=(sum and 0xFF).toByte()
+
+        return p
     }
 
-    private fun startBleScan(){
-
-        log("Scanning devices...")
-
-        if(ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_SCAN
-            ) != PackageManager.PERMISSION_GRANTED
-        ) return
-
-        scanner.startScan(scanCallback)
+    private fun send(cmd:Int, payload:ByteArray = byteArrayOf()){
+        enqueue(build(cmd,payload))
     }
 
-    private val scanCallback = object:ScanCallback(){
+    private fun startHR(){
+        log("💓 Start HR")
+        send(0x6D, byteArrayOf(0x00))
+    }
 
-        override fun onScanResult(callbackType:Int,result:ScanResult){
+    private fun enqueue(p:ByteArray){
+        queue.add(p)
+        if(!isWriting) next()
+    }
 
-            val device = result.device
-            val name = device.name ?: "Unknown"
-            val address = device.address
-            val rssi = result.rssi
+    private fun next(){
+        val g = bluetoothGatt ?: return
+        val p = queue.poll() ?: run { isWriting=false; return }
 
-            if(!discoveredDevices.contains(address)){
+        val char = g.getService(UUID_SERVICE)?.getCharacteristic(UUID_WRITE)
 
-                discoveredDevices.add(address)
+        if(char!=null &&
+            ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED){
 
-                log("Device: $name | RSSI:$rssi")
-            }
+            isWriting=true
+            char.value=p
+            g.writeCharacteristic(char)
+            log("TX: ${p.joinToString(" ") { "%02X".format(it) }}")
+        }
+    }
 
-            if(name.contains("SW",true) && bluetoothGatt == null){
+    private val callback = object:BluetoothGattCallback(){
 
-                log("Watch detected")
-
-                scanner.stopScan(this)
-
-                connectDevice(device)
+        override fun onConnectionStateChange(g:BluetoothGatt, s:Int, new:Int){
+            if(new==BluetoothProfile.STATE_CONNECTED){
+                runOnUiThread{ statusText.text="Conectado" }
+                g.discoverServices()
+            } else if (new == BluetoothProfile.STATE_DISCONNECTED) {
+                mainHandler.removeCallbacks(batteryRunnable)
+                runOnUiThread { statusText.text = "Desconectado" }
             }
         }
-    }
 
-    private fun connectDevice(device:BluetoothDevice){
+        override fun onServicesDiscovered(g:BluetoothGatt, s:Int){
+            val notifyChar = g.getService(UUID_SERVICE)?.getCharacteristic(UUID_NOTIFY)
 
-        if(ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) != PackageManager.PERMISSION_GRANTED
-        ) return
+            if(notifyChar!=null &&
+                ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED){
 
-        log("Connecting...")
+                g.setCharacteristicNotification(notifyChar,true)
+                val desc = notifyChar.getDescriptor(UUID_DESC)
+                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                g.writeDescriptor(desc)
+            }
+        }
 
-        bluetoothGatt = device.connectGatt(this,false,gattCallback)
-    }
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            // Após ativar notificações, iniciamos o loop da bateria
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                mainHandler.post(batteryRunnable)
+            }
+        }
 
-    private val gattCallback = object:BluetoothGattCallback(){
-
-        override fun onConnectionStateChange(
-            gatt:BluetoothGatt,
-            status:Int,
-            newState:Int
-        ){
-
-            if(newState == BluetoothProfile.STATE_CONNECTED){
-
-                log("Connected")
-
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if(status == BluetoothGatt.GATT_SUCCESS && c.uuid == UUID_BATTERY_CHAR){
+                val battery = c.value[0].toInt() and 0xFF
+                lastBatteryLevel = "$battery%"
                 runOnUiThread {
-                    statusText.text = "Status: Connected"
+                    statusText.text = "Conectado 🔋 $lastBatteryLevel"
+                }
+                log("Battery: $lastBatteryLevel")
+            }
+        }
+
+        override fun onCharacteristicWrite(g:BluetoothGatt, c:BluetoothGattCharacteristic, s:Int){
+            isWriting=false
+            // Pequeno delay para estabilidade do rádio Bluetooth
+            mainHandler.postDelayed({ next() }, 50)
+        }
+
+        override fun onCharacteristicChanged(g:BluetoothGatt, c:BluetoothGattCharacteristic){
+            val data = c.value ?: return
+            if(data.size < 5) return
+
+            val type = data[2].toInt() and 0xFF
+            val sub  = data[3].toInt() and 0xFF
+
+            runOnUiThread {
+                if(type==0x20 && sub==0x06){
+                    val bpm = if(data.size > 5) data[5].toInt() and 0xFF else data[4].toInt() and 0xFF
+                    if(bpm in 40..200){
+                        heartText.text = "❤️ $bpm bpm"
+                    }
                 }
 
-                gatt.discoverServices()
-            }
-
-            if(newState == BluetoothProfile.STATE_DISCONNECTED){
-
-                log("Disconnected")
-
-                bluetoothGatt = null
-
-                handler.postDelayed({
-                    startBleScan()
-                },3000)
-            }
-        }
-
-        override fun onServicesDiscovered(
-            gatt:BluetoothGatt,
-            status:Int
-        ){
-
-            log("Services discovered")
-
-            enableNotifications(gatt)
-
-            readBatteryLevel(gatt)
-
-            enableBatteryNotifications(gatt)
-
-            syncWatchData()
-        }
-
-        override fun onCharacteristicChanged(
-            gatt:BluetoothGatt,
-            characteristic:BluetoothGattCharacteristic
-        ){
-
-            val data = characteristic.value
-
-            val hex = data.joinToString(" ") { "%02X".format(it) }
-
-            log("RX: $hex")
-
-            parsePacket(data)
-        }
-    }
-
-    private fun syncWatchData(){
-
-        log("Starting full sync")
-
-        handler.postDelayed({ sendCommand(0x20,0x01) },500)
-        handler.postDelayed({ sendCommand(0x20,0x02) },1500)
-        handler.postDelayed({ sendCommand(0x20,0x03) },2500)
-        handler.postDelayed({ sendCommand(0x20,0x04) },3500)
-    }
-
-    private fun parsePacket(data:ByteArray){
-
-        if(data.size < 4) {
-            log("RX short packet")
-            return
-        }
-
-        val type = data[2].toInt() and 0xFF
-        val subtype = data[3].toInt() and 0xFF
-
-        if(type == 0x20 && subtype == 0x05 && data.size >= 5){
-
-            val battery = data[4].toInt() and 0xFF
-
-            runOnUiThread {
-                batteryText.text = "🔋 Battery: $battery%"
-            }
-        }
-
-        if(type == 0x20 && subtype == 0x07 && data.size >= 7){
-
-            val steps =
-                (data[4].toInt() and 0xFF) or
-                        ((data[5].toInt() and 0xFF) shl 8) or
-                        ((data[6].toInt() and 0xFF) shl 16)
-
-            runOnUiThread {
-                stepsText.text = "👟 $steps"
-            }
-        }
-
-        if(type == 0x20 && subtype == 0x06 && data.size >= 6){
-
-            val bpm = data[5].toInt() and 0xFF
-
-            runOnUiThread {
-                heartText.text = "❤️ $bpm bpm"
-            }
-        }
-    }
-
-    private fun enableNotifications(gatt:BluetoothGatt){
-
-        val service = gatt.getService(
-            UUID.fromString("0000feea-0000-1000-8000-00805f9b34fb")
-        ) ?: return
-
-        for(characteristic in service.characteristics){
-
-            if(characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0){
-
-                gatt.setCharacteristicNotification(characteristic,true)
-
-                val descriptor = characteristic.getDescriptor(
-                    UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                )
-
-                descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-
-                if(descriptor != null){
-                    gatt.writeDescriptor(descriptor)
+                if(type==0x20 && sub==0x08 && data.size >= 6){
+                    val steps = (data[4].toInt() and 0xFF) or ((data[5].toInt() and 0xFF) shl 8)
+                    if(steps in 0..50000) {
+                        stepsText.text = "👟 $steps passos"
+                    }
                 }
-
-                log("Notifications enabled for ${characteristic.uuid}")
             }
         }
     }
 
-    private fun readBatteryLevel(gatt:BluetoothGatt){
-
-        val service = gatt.getService(
-            UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
-        )
-
-        val characteristic = service?.getCharacteristic(
-            UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
-        )
-
-        characteristic?.let {
-            gatt.readCharacteristic(it)
+    private fun log(s:String){
+        runOnUiThread{
+            logText.append("\n$s")
+            scroll.post{ scroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
     }
 
-    private fun enableBatteryNotifications(gatt:BluetoothGatt){
+    private fun startScan(){
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        val scanner = adapter.bluetoothLeScanner
+        if(ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)!=PackageManager.PERMISSION_GRANTED) return
 
-        val service = gatt.getService(
-            UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
-        )
-
-        val characteristic = service?.getCharacteristic(
-            UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
-        )
-
-        if(characteristic != null){
-
-            gatt.setCharacteristicNotification(characteristic,true)
-
-            val descriptor = characteristic.getDescriptor(
-                UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-            )
-
-            descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-
-            if(descriptor != null){
-                gatt.writeDescriptor(descriptor)
+        scanner.startScan(object:ScanCallback(){
+            override fun onScanResult(t:Int, r:ScanResult){
+                if(r.device.name?.contains("SW/90",true)==true && bluetoothGatt==null){
+                    scanner.stopScan(this)
+                    bluetoothGatt = r.device.connectGatt(this@MainActivity,false,callback)
+                }
             }
-        }
+        })
     }
 
-    private fun sendCommand(type:Int,subtype:Int){
-
-        val command = byteArrayOf(
-            0xFE.toByte(),
-            0xEA.toByte(),
-            type.toByte(),
-            subtype.toByte()
-        )
-
-        sendCommandRaw(command)
-
-        log("TX: FE EA ${"%02X".format(type)} ${"%02X".format(subtype)}")
-    }
-
-    private fun sendCommandRaw(command:ByteArray){
-
-        val gatt = bluetoothGatt ?: return
-
-        val service = gatt.getService(
-            UUID.fromString("0000feea-0000-1000-8000-00805f9b34fb")
-        )
-
-        val characteristic = service?.getCharacteristic(
-            UUID.fromString("0000fee1-0000-1000-8000-00805f9b34fb")
-        ) ?: return
-
-        characteristic.value = command
-
-        gatt.writeCharacteristic(characteristic)
-    }
-
-    private fun scanServices(){
-
-        val gatt = bluetoothGatt ?: return
-
-        log("===== SERVICES =====")
-
-        for(service in gatt.services){
-
-            log("SERVICE: ${service.uuid}")
-
-            for(characteristic in service.characteristics){
-
-                log("  CHAR: ${characteristic.uuid}")
-            }
-        }
-    }
-
-    private fun startCommandScan(){
-
-        log("Command scan started")
-
-        Thread{
-
-            for(i in 0..30){
-
-                sendCommand(i,1)
-
-                Thread.sleep(500)
-            }
-
-        }.start()
+    private fun requestPermissions(){
+        ActivityCompat.requestPermissions(this,
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ),1)
     }
 }
